@@ -2,10 +2,8 @@ use core::mem::size_of;
 
 use crate::builder::SUFFIX;
 
-#[inline(always)]
-fn get_usize_len() -> usize {
-    if cfg!(target_pointer_width = "64") { 64 } else if cfg!(target_pointer_width = "32") { 32 } else { panic!() }
-}
+const USIZE_LEN: usize = 64;
+const COUNTER_PER_SLOT: usize = USIZE_LEN >> 2;
 
 /// bitmap only for bloom filter.
 #[derive(Debug)]
@@ -21,13 +19,13 @@ impl BloomBitVec {
     pub fn new(slots: usize) -> Self {
         BloomBitVec {
             storage: vec![0; slots],
-            nbits: (slots * get_usize_len()) as u64,
+            nbits: (slots * COUNTER_PER_SLOT) as u64,
         }
     }
     pub fn from_elem(slots: usize, bit: bool) -> Self {
         BloomBitVec {
             storage: vec![if bit { !0 } else { 0 }; slots],
-            nbits: (slots * get_usize_len()) as u64,
+            nbits: (slots * COUNTER_PER_SLOT) as u64,
         }
     }
 
@@ -105,94 +103,110 @@ impl BloomBitVec {
     }
 }
 
+pub trait Storage {
+    type Init;
+    fn new(slots: usize, init: Self::Init) -> Self;
+    fn get(&self, slot: usize) -> usize;
+    fn slots(&self) -> usize;
+}
+pub trait StorageMut: Storage {
+    fn update(&mut self, slot: usize, op: impl FnOnce(usize) -> Option<usize>);
+    fn clear(&mut self);
+}
+
+impl Storage for Vec<usize> {
+    type Init = ();
+    #[inline]
+    fn new(slots: usize, _: ()) -> Self {
+        vec![0; slots]
+    }
+    #[inline]
+    fn get(&self, slot: usize) -> usize {
+        self[slot]
+    }
+    #[inline]
+    fn slots(&self) -> usize {
+        self.len()
+    }
+}
+impl StorageMut for Vec<usize> {
+    #[inline]
+    fn update(&mut self, slot: usize, op: impl FnOnce(usize) -> Option<usize>) {
+        let v = self[slot];
+        if let Some(v) = op(v) {
+            self[slot] = v;
+        }
+    }
+    #[inline]
+    fn clear(&mut self) {
+        self.fill(0);
+    }
+}
+
 /// counter vector for counting bloom filter.
 #[derive(Debug)]
 #[derive(Clone)]
-pub(crate) struct CountingVec {
+pub(crate) struct CountingVec<S> {
     /// Internal representation of the vector
-    pub(crate) storage: Vec<usize>,
-    /// The number of valid counter in the internal representation
-    pub(crate) counters: u64,
-    /// The number of valid counter in a slot which mean usize.
-    pub(crate) counter_per_slot: usize,
+    pub(crate) storage: S,
 }
-
-impl CountingVec {
+impl<S: Storage> CountingVec<S> {
     /// create a CountingVec
-    pub fn new(slots: usize) -> Self {
-        let counter_per_slot = get_usize_len() >> 2;
+    pub fn new(storage: S) -> Self {
         CountingVec {
-            storage: vec![0; slots],
-            counters: (slots * counter_per_slot) as u64,
-            counter_per_slot,
-        }
-    }
-
-    #[inline]
-    pub fn increment(&mut self, index: usize) {
-        let current = self.get(index);
-        #[cfg(target_pointer_width = "64")]
-        if current != 0b1111 {
-            let current = current + 1;
-            let w = index >> 4;
-            let b = index & 0b1111;
-            let move_bits = (15 - b) * 4;
-            self.storage[w] =
-                (self.storage[w] & !(0b1111 << move_bits)) | (current << move_bits)
-        }
-
-        #[cfg(target_pointer_width = "32")]
-        if current != 0b111 {
-            let current = current + 1;
-            let w = index >> 3;
-            let b = index & 0b111;
-            let move_bits = (7 - b) * 4;
-            self.storage[w] =
-                (self.storage[w] & !(0b1111 << move_bits)) | (current << move_bits)
-        }
-    }
-
-    #[inline]
-    pub fn decrement(&mut self, index: usize) {
-        let current = self.get(index);
-        if current > 0 {
-            if cfg!(target_pointer_width="64") {
-                let current = current - 1;
-                let w = index >> 4;
-                let b = index & 0b1111;
-                let move_bits = (15 - b) * 4;
-                self.storage[w] =
-                    (self.storage[w] & !(0b1111 << move_bits)) | (current << move_bits)
-            } else if cfg!(target_pointer_width="32") {
-                let current = current - 1;
-                let w = index >> 3;
-                let b = index & 0b111;
-                let move_bits = (7 - b) * 4;
-                self.storage[w] =
-                    (self.storage[w] & !(0b1111 << move_bits)) | (current << move_bits)
-            }
+            storage,
         }
     }
 
     #[inline]
     pub fn get(&self, index: usize) -> usize {
-        #[cfg(target_pointer_width = "64")]
-            let w = index >> 4;
-        #[cfg(target_pointer_width = "64")]
-            let b = index & 0b1111;
-        #[cfg(target_pointer_width = "32")]
-            let w = index >> 3;
-        #[cfg(target_pointer_width = "32")]
-            let b = index & 0b111;
-        let slot = self.storage[w];
-        #[cfg(target_pointer_width = "64")]
-        return (slot >> ((15 - b) * 4)) & 0b1111;
-        #[cfg(target_pointer_width = "32")]
-        return (slot >> ((7 - b) * 4)) & 0b111;
+        let w = index >> 4;
+        let b = index & 0b1111;
+        let slot = self.storage.get(w);
+        (slot >> ((15 - b) * 4)) & 0b1111
+    }
+
+    pub fn counters(&self) -> usize {
+        self.storage.slots() * COUNTER_PER_SLOT
+    }
+}
+impl<S: StorageMut> CountingVec<S> {
+    #[inline]
+    pub fn increment(&mut self, index: usize) {
+        let w = index >> 4;
+        let b = index & 0b1111;
+        self.storage.update(w, |slot| {
+            let current = (slot >> ((15 - b) * 4)) & 0b1111;
+            if current != 0b1111 {
+                let current = current + 1;
+                let move_bits = (15 - b) * 4;
+                Some((slot & !(0b1111 << move_bits)) | (current << move_bits))
+            } else {
+                None
+            }
+        });
+    }
+
+    #[inline]
+    pub fn decrement(&mut self, index: usize) {
+        let w = index >> 4;
+        let b = index & 0b1111;
+        self.storage.update(w, |slot| {
+            let current = (slot >> ((15 - b) * 4)) & 0b1111;
+            if current > 0 {
+                let current = current - 1;
+                let w = index >> 4;
+                let b = index & 0b1111;
+                let move_bits = (15 - b) * 4;
+                Some((slot & !(0b1111 << move_bits)) | (current << move_bits))
+            } else {
+                None
+            }
+        });
     }
 
     pub fn clear(&mut self) {
-        self.storage.fill(0);
+        self.storage.clear();
     }
 }
 
@@ -208,16 +222,16 @@ fn test_vec() {
 
 #[test]
 fn test_size() {
-    println!("{}", get_usize_len());
+    println!("{}", COUNTER_PER_SLOT);
     #[cfg(target_pointer_width = "64")]
-    assert_eq!(get_usize_len(), 64);
+    assert_eq!(COUNTER_PER_SLOT, 64);
     #[cfg(target_pointer_width = "32")]
-    assert_eq!(get_usize_len(), 32);
+    assert_eq!(COUNTER_PER_SLOT, 32);
 }
 
 #[test]
 fn test_count_vec() {
-    let mut vec = CountingVec::new(10);
+    let mut vec = CountingVec::new(vec![0; 10]);
     vec.increment(7);
 
     assert_eq!(1, vec.get(7))
