@@ -2,6 +2,7 @@ extern crate core;
 
 pub use bloom::{BloomFilter, CountingBloomFilter};
 pub use builder::FilterBuilder;
+pub use vec::{Storage, StorageMut};
 
 mod builder;
 mod bloom;

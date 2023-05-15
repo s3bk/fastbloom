@@ -1,5 +1,6 @@
 use crate::bloom::{BloomFilter, CountingBloomFilter};
 use crate::Membership;
+use crate::vec::Storage;
 
 /// Builder for Bloom Filters.
 #[derive(Clone)]
@@ -177,9 +178,9 @@ impl FilterBuilder {
 
     /// Constructs a Counting Bloom filter using the specified parameters and computing missing parameters
     /// if possible (e.g. the optimal Bloom filter bit size).
-    pub fn build_counting_bloom_filter(&mut self) -> CountingBloomFilter {
+    pub fn build_counting_bloom_filter<S: Storage>(&mut self, init: S::Init) -> CountingBloomFilter<S> {
         self.complete();
-        CountingBloomFilter::new(self.clone())
+        CountingBloomFilter::new(self.clone(), init)
     }
 
     /// Checks whether a configuration is compatible to another configuration based on the size of

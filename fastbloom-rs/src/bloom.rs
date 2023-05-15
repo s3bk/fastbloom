@@ -7,7 +7,7 @@ use xxhash_rust::xxh3::xxh3_64_with_seed;
 
 use crate::{Deletable, Hashes, Membership};
 use crate::builder::FilterBuilder;
-use crate::vec::{BloomBitVec, CountingVec};
+use crate::vec::{BloomBitVec, CountingVec, Storage, StorageMut};
 
 #[inline]
 fn bit_set(bit_set: &mut BloomBitVec, value: &[u8], m: u64, k: u64) {
@@ -367,55 +367,26 @@ impl BloomFilter {
 /// Algorithms, LNCS 4168, 2006
 #[derive(Clone)]
 #[derive(Debug)]
-pub struct CountingBloomFilter {
+pub struct CountingBloomFilter<S=Vec<usize>> {
     config: FilterBuilder,
-    counting_vec: CountingVec,
+    counting_vec: CountingVec<S>,
 }
 
-macro_rules! get_array {
-    ($name:ident, $native:ty, $len:expr) => {
-        impl CountingBloomFilter {
-            pub fn $name(&self) -> &[$native] {
-                let ptr = self.counting_vec.storage.as_ptr() as *const $native;
-                #[cfg(target_pointer_width = "64")]
-                    let arr = slice_from_raw_parts(ptr, self.counting_vec.storage.len() * $len);
-                #[cfg(target_pointer_width = "32")]
-                    if cfg!(target_pointer_width= "32") {
-                        if self.counting_vec.storage.len() % 2 != 0 {
-                            panic!("CountingVec with len {} can't export as u64 array!", self.counting_vec.storage.len())
-                        }
-                    }
-                #[cfg(target_pointer_width = "32")]
-                    let arr = slice_from_raw_parts(ptr, self.counting_vec.storage.len() * $len / 2);
-                unsafe { &*arr }
-            }
-        }
-    };
-}
-
-get_array!(get_u8_array, u8, 8);
-get_array!(get_u16_array, u16, 4);
-get_array!(get_u32_array, u32, 2);
-get_array!(get_u64_array, u64, 1);
-
-impl CountingBloomFilter {
-    pub fn new(mut config: FilterBuilder) -> Self {
+impl<S: Storage> CountingBloomFilter<S> {
+    pub fn new(mut config: FilterBuilder, init: S::Init) -> Self {
         config.complete();
-        #[cfg(target_pointer_width = "64")]
-            let counting_vec = CountingVec::new((config.size >> 4) as usize);
-        #[cfg(target_pointer_width = "32")]
-            let counting_vec = CountingVec::new((config.size >> 3) as usize);
+        let counting_vec = CountingVec::new(S::new((config.size >> 4) as usize, init));
         CountingBloomFilter { config, counting_vec }
     }
 
-    pub(crate) fn set_counting_vec(&mut self, counting_vec: CountingVec) {
-        assert_eq!(self.config.size, counting_vec.counters as u64);
+    pub(crate) fn set_counting_vec(&mut self, counting_vec: CountingVec<S>) {
+        assert_eq!(self.config.size, counting_vec.counters() as u64);
         self.counting_vec = counting_vec
     }
 
     /// Checks if two Counting Bloom filters are compatible, i.e. have compatible parameters (hash
     /// function, size, etc.)
-    fn compatible(&self, other: &BloomFilter) -> bool {
+    pub fn compatible(&self, other: &BloomFilter) -> bool {
         self.config.is_compatible_to(&other.config)
     }
 
@@ -432,41 +403,21 @@ impl CountingBloomFilter {
     pub fn config(&self) -> FilterBuilder {
         self.config.clone()
     }
-}
 
-macro_rules! from_array {
-    ($name:ident, $native:ty, $num:expr) => {
-        impl CountingBloomFilter {
-            pub fn $name(array: &[$native], hashes: u32, enable_repeat_insert:bool) -> Self {
-                let mut config =
-                    FilterBuilder::from_size_and_hashes((array.len() * $num) as u64, hashes);
-                config.enable_repeat_insert(enable_repeat_insert);
-                config.complete();
-                #[cfg(target_pointer_width = "64")]
-                    let mut counting_vec = CountingVec::new((config.size >> 4) as usize);
-                #[cfg(target_pointer_width = "32")]
-                    let mut counting_vec = CountingVec::new((config.size >> 3) as usize);
+    pub fn from_storage(storage: S, hashes: u32, enable_repeat_insert:bool) -> Self {
+        let mut config =
+            FilterBuilder::from_size_and_hashes((storage.slots() * 16) as u64, hashes);
+        config.enable_repeat_insert(enable_repeat_insert);
+        config.complete();
+        let counting_vec = CountingVec::new(storage);
 
-                let ptr = array.as_ptr() as *const usize;
-                #[cfg(target_pointer_width = "64")]
-                    let usize_array = slice_from_raw_parts(ptr, (config.size >> 4) as usize);
-                #[cfg(target_pointer_width = "32")]
-                    let usize_array = slice_from_raw_parts(ptr, (config.size >> 3) as usize);
+        CountingBloomFilter { config, counting_vec }
+    }
 
-                counting_vec.storage.copy_from_slice(unsafe { &*usize_array });
+    pub fn storage(&self) -> &S {
+        &self.counting_vec.storage
+    }
 
-                CountingBloomFilter { config, counting_vec }
-            }
-        }
-    };
-}
-
-from_array!(from_u8_array, u8, 2);
-from_array!(from_u16_array, u16, 4);
-from_array!(from_u32_array, u32, 8);
-from_array!(from_u64_array, u64, 16);
-
-impl CountingBloomFilter {
     /// Get the estimate count for element in this counting bloom filter.
     /// See: https://github.com/yankun1992/fastbloom/issues/3
     pub fn estimate_count(&self, element: &[u8]) -> usize {
@@ -492,8 +443,8 @@ impl CountingBloomFilter {
     }
 }
 
-impl Membership for CountingBloomFilter {
-    fn add(&mut self, element: &[u8]) {
+impl<S: StorageMut> CountingBloomFilter<S> {
+    pub fn add(&mut self, element: &[u8]) {
         let m = self.config.size;
         // let hash1 = (murmur3_x64_128(element, 0) % m) as u64;
         // let hash2 = (murmur3_x64_128(element, 32) % m) as u64;
@@ -519,7 +470,34 @@ impl Membership for CountingBloomFilter {
         };
         self.counting_vec.increment(hash1 as usize);
     }
+    pub fn clear(&mut self) {
+        self.counting_vec.clear()
+    }
+    pub fn remove(&mut self, element: &[u8]) {
+        let m = self.config.size;
+        // let hash1 = (murmur3_x64_128(element, 0) % m) as u64;
+        // let hash2 = (murmur3_x64_128(element, 32) % m) as u64;
+        let hash1 = xxh3_64_with_seed(element, 0) % m;
+        let hash2 = xxh3_64_with_seed(element, 32) % m;
 
+        let mut res = self.counting_vec.get(hash1 as usize) > 0;
+        // let m = self.config.size;
+        for i in 1..self.config.hashes as u64 {
+            let mo = ((hash1 + i * hash2) % m) as usize;
+            res = res && (self.counting_vec.get(mo) > 0);
+        }
+
+        // contains
+        if res {
+            for i in 1..self.config.hashes as u64 {
+                let mo = ((hash1 + i * hash2) % m) as usize;
+                self.counting_vec.decrement(mo);
+            };
+            self.counting_vec.decrement(hash1 as usize);
+        }
+    }
+}
+impl<S: Storage> CountingBloomFilter<S> {
     #[inline]
     fn contains(&self, element: &[u8]) -> bool {
         let m = self.config.size;
@@ -563,38 +541,9 @@ impl Membership for CountingBloomFilter {
         true
     }
 
-    fn clear(&mut self) {
-        self.counting_vec.clear()
-    }
 }
 
-impl Deletable for CountingBloomFilter {
-    fn remove(&mut self, element: &[u8]) {
-        let m = self.config.size;
-        // let hash1 = (murmur3_x64_128(element, 0) % m) as u64;
-        // let hash2 = (murmur3_x64_128(element, 32) % m) as u64;
-        let hash1 = xxh3_64_with_seed(element, 0) % m;
-        let hash2 = xxh3_64_with_seed(element, 32) % m;
-
-        let mut res = self.counting_vec.get(hash1 as usize) > 0;
-        // let m = self.config.size;
-        for i in 1..self.config.hashes as u64 {
-            let mo = ((hash1 + i * hash2) % m) as usize;
-            res = res && (self.counting_vec.get(mo) > 0);
-        }
-
-        // contains
-        if res {
-            for i in 1..self.config.hashes as u64 {
-                let mo = ((hash1 + i * hash2) % m) as usize;
-                self.counting_vec.decrement(mo);
-            };
-            self.counting_vec.decrement(hash1 as usize);
-        }
-    }
-}
-
-impl Hashes for CountingBloomFilter {
+impl<S: Storage> Hashes for CountingBloomFilter<S> {
     fn hashes(&self) -> u32 {
         self.config.hashes
     }
@@ -732,7 +681,7 @@ fn bloom_hash_indices_test() {
 fn counting_bloom_test() {
     let mut builder =
         FilterBuilder::new(10_000, 0.01);
-    let mut bloom = builder.build_counting_bloom_filter();
+    let mut bloom = builder.build_counting_bloom_filter::<Vec<usize>>(());
 
     bloom.add(b"hello");
 
@@ -747,7 +696,7 @@ fn counting_bloom_repeat_test() {
     let mut builder = FilterBuilder::new(100_000, 0.01);
     // enable_repeat_insert is true
     builder.enable_repeat_insert(true);
-    let mut cbf = builder.build_counting_bloom_filter();
+    let mut cbf = builder.build_counting_bloom_filter::<Vec<usize>>(());
     cbf.add(b"hello"); // modify underlying vector counter.
     cbf.add(b"hello"); // modify underlying vector counter.
     assert_eq!(cbf.contains(b"hello"), true);
@@ -758,7 +707,7 @@ fn counting_bloom_repeat_test() {
 
     // enable_repeat_insert is false
     builder.enable_repeat_insert(false);
-    let mut cbf = builder.build_counting_bloom_filter();
+    let mut cbf = builder.build_counting_bloom_filter::<Vec<usize>>(());
     cbf.add(b"hello"); // modify underlying vector counter.
     cbf.add(b"hello"); // not modify underlying vector counter because b"hello" has been added.
     assert_eq!(cbf.contains(b"hello"), true);
@@ -769,47 +718,27 @@ fn counting_bloom_repeat_test() {
 #[test]
 fn counting_bloom_from_test() {
     let mut builder = FilterBuilder::new(10_000_000, 0.01);
-    let mut cbf = builder.build_counting_bloom_filter();
+    let mut cbf = builder.build_counting_bloom_filter::<Vec<usize>>(());
 
     cbf.add(b"hello");
     cbf.add(b"hello");
 
-    let mut cbf_copy = CountingBloomFilter::from_u8_array(cbf.get_u8_array(), builder.hashes, true);
+    let storage = cbf.storage();
+
+    let mut cbf_copy = CountingBloomFilter::from_storage(storage.clone(), builder.hashes, true);
     assert_eq!(cbf_copy.contains(b"hello"), true);
     cbf_copy.remove(b"hello");
     assert_eq!(cbf_copy.contains(b"hello"), true);
     cbf_copy.remove(b"hello");
     assert_eq!(cbf_copy.contains(b"hello"), false);
 
-    let mut cbf_copy = CountingBloomFilter::from_u16_array(cbf.get_u16_array(), builder.hashes, true);
-    assert_eq!(cbf_copy.contains(b"hello"), true);
-    cbf_copy.remove(b"hello");
-    assert_eq!(cbf_copy.contains(b"hello"), true);
-    cbf_copy.remove(b"hello");
-    assert_eq!(cbf_copy.contains(b"hello"), false);
-
-    let mut cbf_copy = CountingBloomFilter::from_u32_array(cbf.get_u32_array(), builder.hashes, true);
-    assert_eq!(cbf_copy.contains(b"hello"), true);
-    cbf_copy.remove(b"hello");
-    assert_eq!(cbf_copy.contains(b"hello"), true);
-    cbf_copy.remove(b"hello");
-    assert_eq!(cbf_copy.contains(b"hello"), false);
-
-    #[cfg(target_pointer_width = "64")]{
-        let mut cbf_copy = CountingBloomFilter::from_u64_array(cbf.get_u64_array(), builder.hashes, true);
-        assert_eq!(cbf_copy.contains(b"hello"), true);
-        cbf_copy.remove(b"hello");
-        assert_eq!(cbf_copy.contains(b"hello"), true);
-        cbf_copy.remove(b"hello");
-        assert_eq!(cbf_copy.contains(b"hello"), false);
-    }
 }
 
 #[test]
 fn counting_bloom_hash_indices_test() {
     let mut builder =
         FilterBuilder::new(10_000, 0.01);
-    let mut bloom = builder.build_counting_bloom_filter();
+    let mut bloom = builder.build_counting_bloom_filter::<Vec<usize>>(());
 
     bloom.add(b"hello");
 
@@ -827,7 +756,7 @@ fn counting_bloom_hash_indices_test() {
 fn counting_bloom_estimate_count() {
     let mut builder =
         FilterBuilder::new(10_000, 0.01);
-    let mut bloom = builder.build_counting_bloom_filter();
+    let mut bloom = builder.build_counting_bloom_filter::<Vec<usize>>(());
 
     bloom.add(b"hello");
     bloom.add(b"world");
